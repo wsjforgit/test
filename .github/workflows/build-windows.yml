@@ -1,0 +1,140 @@
+name: Build and Release Delta Sensitivity Tester
+
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-test-release:
+    if: ${{ !contains(github.event.head_commit.message || '', '[skip ci]') }}
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.23.x'
+          cache: false
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Read version
+        id: version
+        shell: pwsh
+        run: |
+          $v = (Get-Content VERSION -Raw).Trim()
+          if ([string]::IsNullOrWhiteSpace($v)) { throw 'VERSION is empty' }
+          "version=$v" >> $env:GITHUB_OUTPUT
+          "tag=v$v" >> $env:GITHUB_OUTPUT
+
+      - name: Restore source bundle
+        shell: pwsh
+        run: |
+          $v = '${{ steps.version.outputs.version }}'
+          $bundle = ".\build\source_${v}.zip.b64"
+          if (!(Test-Path $bundle)) { throw "Missing source bundle: $bundle" }
+          $b64 = Get-Content -Raw $bundle
+          [IO.File]::WriteAllBytes("source.zip", [Convert]::FromBase64String($b64))
+          Remove-Item -Recurse -Force src -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force src | Out-Null
+          Expand-Archive .\source.zip -DestinationPath .\src -Force
+
+      - name: Check JavaScript syntax
+        shell: pwsh
+        run: |
+          node --check .\src\web\delta-empirical-model-v2.js
+          node --check .\src\web\specialty-scoring-v3.js
+          node --check .\src\web\parameter-inference-v3.js
+          node --check .\src\web\three-round-controller-v3.js
+          node --check .\src\web\game-mapping-v3.js
+
+      - name: Go compile test
+        shell: pwsh
+        working-directory: src
+        run: go test ./...
+
+      - name: Build Windows x64
+        shell: pwsh
+        working-directory: src
+        run: |
+          New-Item -ItemType Directory -Force ..\dist | Out-Null
+          $v = '${{ steps.version.outputs.version }}'
+          go build -trimpath -ldflags "-s -w -X main.appVersion=$v" -o "..\dist\DeltaSensitivityTester_${v}_win-x64.exe" .
+
+      - name: Windows self-test
+        shell: pwsh
+        run: |
+          $v = '${{ steps.version.outputs.version }}'
+          $output = & ".\dist\DeltaSensitivityTester_${v}_win-x64.exe" --self-test
+          $output | Write-Host
+          if ($LASTEXITCODE -ne 0) { throw 'Self-test returned non-zero exit code' }
+          if (($output -join "`n") -notmatch 'SELF_TEST_OK') { throw 'SELF_TEST_OK marker missing' }
+
+      - name: Package and hash
+        shell: pwsh
+        run: |
+          $v = '${{ steps.version.outputs.version }}'
+          $exe = ".\dist\DeltaSensitivityTester_${v}_win-x64.exe"
+          $hash = (Get-FileHash $exe -Algorithm SHA256).Hash.ToLower()
+          "SHA256  $hash  DeltaSensitivityTester_${v}_win-x64.exe" | Set-Content ".\dist\SHA256.txt"
+          Copy-Item README.md .\dist\README.md
+          Copy-Item VERSION.json .\dist\VERSION.json
+          Compress-Archive -Path $exe,.\dist\SHA256.txt,.\dist\README.md,.\dist\VERSION.json -DestinationPath ".\dist\DeltaSensitivityTester_${v}_Windows_x64.zip" -Force
+
+      - name: Publish readable source snapshot to master
+        shell: pwsh
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          Remove-Item -Recurse -Force source -ErrorAction SilentlyContinue
+          Copy-Item -Recurse .\src .\source
+          git add source
+          if (git diff --cached --quiet) {
+            Write-Host 'Readable source snapshot already current.'
+          } else {
+            $v = '${{ steps.version.outputs.version }}'
+            git commit -m "chore: sync readable source $v [skip ci]"
+            git push origin HEAD:master
+          }
+
+      - name: Upload CI artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: DeltaSensitivityTester-${{ steps.version.outputs.version }}-Windows-x64
+          path: |
+            dist/DeltaSensitivityTester_${{ steps.version.outputs.version }}_win-x64.exe
+            dist/DeltaSensitivityTester_${{ steps.version.outputs.version }}_Windows_x64.zip
+            dist/SHA256.txt
+            dist/VERSION.json
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Create versioned GitHub release if missing
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $v = '${{ steps.version.outputs.version }}'
+          $tag = '${{ steps.version.outputs.tag }}'
+          gh release view $tag *> $null
+          if ($LASTEXITCODE -eq 0) {
+            Write-Host "Release $tag already exists; keeping existing release."
+          } else {
+            gh release create $tag `
+              ".\dist\DeltaSensitivityTester_${v}_win-x64.exe" `
+              ".\dist\DeltaSensitivityTester_${v}_Windows_x64.zip" `
+              ".\dist\SHA256.txt" `
+              --target $env:GITHUB_SHA `
+              --title "Delta Sensitivity Tester $tag" `
+              --notes "Windows x64 portable release. See CHANGELOG.md for details."
+          }
