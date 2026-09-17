@@ -1,0 +1,98 @@
+name: Build Delta Sensitivity Tester RC1
+
+on:
+  push:
+    branches:
+      - delta-sensitivity-rc1-build
+  workflow_dispatch:
+
+jobs:
+  build-and-smoke-test:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET 8
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Decode source archive
+        shell: pwsh
+        run: |
+          $b64 = Get-Content -Raw .\build\source_rc1.zip.b64
+          [IO.File]::WriteAllBytes("source.zip", [Convert]::FromBase64String($b64))
+          New-Item -ItemType Directory -Force src | Out-Null
+          Expand-Archive .\source.zip -DestinationPath .\src -Force
+          Get-ChildItem .\src
+
+      - name: Check JavaScript model syntax
+        shell: pwsh
+        run: |
+          node --check .\src\www\model\delta-empirical-model-v2.js
+          node --check .\src\www\model\specialty-scoring-v3.js
+          node --check .\src\www\model\parameter-inference-v3.js
+          node --check .\src\www\model\three-round-controller-v3.js
+          node --check .\src\www\model\game-mapping-v3.js
+
+      - name: Restore
+        shell: pwsh
+        working-directory: src
+        run: dotnet restore .\DeltaSensitivityTester.csproj
+
+      - name: Publish Windows x64 single EXE
+        shell: pwsh
+        working-directory: src
+        run: |
+          dotnet publish .\DeltaSensitivityTester.csproj `
+            -c Release `
+            -r win-x64 `
+            --self-contained true `
+            -p:PublishSingleFile=true `
+            -p:IncludeNativeLibrariesForSelfExtract=true `
+            -p:EnableCompressionInSingleFile=true `
+            -p:DebugType=None `
+            -p:DebugSymbols=false `
+            -o .\publish
+
+      - name: Verify PE and smoke launch
+        shell: pwsh
+        working-directory: src
+        run: .\verify-win.ps1
+
+      - name: Runtime environment diagnostics
+        if: always()
+        shell: pwsh
+        run: |
+          Write-Host "Windows version:"
+          Get-ComputerInfo | Select-Object WindowsProductName, WindowsVersion, OsBuildNumber
+          Write-Host "dotnet:"
+          dotnet --info
+          Write-Host "WebView2 / Edge candidates:"
+          Get-ChildItem "C:\Program Files (x86)\Microsoft\EdgeWebView\Application" -ErrorAction SilentlyContinue | Select-Object -First 5 FullName
+          Get-ChildItem "C:\Program Files (x86)\Microsoft\Edge\Application" -ErrorAction SilentlyContinue | Select-Object -First 5 FullName
+
+      - name: Package RC1
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force artifact | Out-Null
+          Copy-Item .\src\publish\DeltaSensitivityTester.exe .\artifact\DeltaSensitivityTester_RC1.exe
+          Copy-Item .\src\README.md .\artifact\README.txt
+          $hash = (Get-FileHash .\artifact\DeltaSensitivityTester_RC1.exe -Algorithm SHA256).Hash
+          "SHA256  $hash  DeltaSensitivityTester_RC1.exe" | Set-Content .\artifact\SHA256.txt
+          Compress-Archive .\artifact\* .\DeltaSensitivityTester_RC1_Windows_x64.zip -Force
+          Get-ChildItem .\artifact
+
+      - name: Upload Windows artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: DeltaSensitivityTester-RC1-Windows-x64
+          path: |
+            DeltaSensitivityTester_RC1_Windows_x64.zip
+            artifact/DeltaSensitivityTester_RC1.exe
+            artifact/SHA256.txt
+            artifact/README.txt
+          if-no-files-found: error
+          retention-days: 7
