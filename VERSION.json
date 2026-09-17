@@ -1,0 +1,14 @@
+{
+  "app": "DeltaSensitivityTester",
+  "version": "1.0.0-rc2",
+  "channel": "release-candidate",
+  "platform": "windows-x64",
+  "empirical_model": "v2",
+  "inference_algorithm": "v3",
+  "reference_profile": {
+    "fov": 90,
+    "mdv": 1.33,
+    "ads_mode": "MDV only"
+  },
+  "repository": "wsjforgit/test"
+}
